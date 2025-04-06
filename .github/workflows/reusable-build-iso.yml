@@ -1,0 +1,178 @@
+name: Reusable ISO
+on:
+  workflow_call:
+    inputs:
+      image_flavors:
+        description: "JSON string of flavors to build, '[main, nvidia-open]'"
+        default: "['main', 'nvidia-open']"
+        type: string
+      brand_name:
+        description: "The Brand Name: silverblue"
+        required: true
+        default: "['cosmic', 'cosmic-dx']"
+        type: string
+      fedora_version:
+        description: "The Fedora Version: 42"
+        required: true
+        default: 42
+        type: number
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}-${{ inputs.brand_name}}-${{ inputs.fedora_version }}
+  cancel-in-progress: true
+
+jobs:
+  build-iso:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image_flavor: ${{ fromJson(inputs.image_flavors) }}
+        base_name: ${{ fromJson(inputs.brand_name) }}
+        fedora_version: ["${{ inputs.fedora_version }}"]
+    env:
+      BASE_IMAGE_NAME: 'cosmic-atomic'
+      IMAGE_NAME: ${{ matrix.base_name }}${{ matrix.image_flavor != 'main' && format('-{0}', matrix.image_flavor) || '' }}
+      FEDORA_VERSION: ${{ matrix.fedora_version }}
+      DEFAULT_TAG: ${{ matrix.fedora_version }}
+      ISO_BUILD_DIR: ${{ github.workspace }}/${{ matrix.base_name }}${{ matrix.image_flavor != 'main' && format('-{0}', matrix.image_flavor) || '' }}_build
+      ISO_NAME: ${{ matrix.base_name }}${{ matrix.image_flavor != 'main' && format('-{0}', matrix.image_flavor) || '' }}-${{ matrix.fedora_version }}.iso
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+          
+      - name: Build ISO
+        shell: bash
+        run: |
+          build_dir="${{ env.IMAGE_NAME }}_build"
+          mkdir -p "$build_dir"
+
+          if [[ -f "${build_dir}/${{ env.IMAGE_NAME }}-${{ env.DEFAULT_TAG }}.iso" || -f "${build_dir}/${{ env.IMAGE_NAME }}-${{ env.DEFAULT_TAG }}.iso-CHECKSUM" ]]; then
+              echo "ERROR - ISO or Checksum already exist. Please mv or rm to build new ISO"
+              exit 1
+          fi
+
+          IMAGE_FULL=ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ env.DEFAULT_TAG }}
+          IMAGE_REPO=ghcr.io/${{ github.repository_owner }}
+          podman pull "${IMAGE_FULL}"
+
+          FLATPAK_DIR_SHORTNAME="${{env.BASE_IMAGE_NAME}}_flatpaks"
+
+          # Generate Flatpak List
+          TEMP_FLATPAK_INSTALL_DIR="$(mktemp -d -p /tmp flatpak-XXXXX)"
+          flatpak_refs=()
+          while IFS= read -r line; do
+              flatpak_refs+=("$line")
+          done < "${FLATPAK_DIR_SHORTNAME}/flatpaks"
+
+          # Add DX Flatpaks if needed
+          if [[ "${{ env.IMAGE_NAME }}" =~ dx ]]; then
+              while IFS= read -r line; do
+                  flatpak_refs+=("$line")
+              done < "dx_flatpaks/flatpaks"
+          fi
+
+          echo "Flatpak refs: ${flatpak_refs[@]}"
+
+          # Generate Install Script for Flatpaks
+          tee "${TEMP_FLATPAK_INSTALL_DIR}/install-flatpaks.sh"<<EOF
+          mkdir -p /flatpak/flatpak /flatpak/triggers
+          mkdir -p /var/tmp
+          chmod -R 1777 /var/tmp
+          flatpak config --system --set languages "*"
+          #Add the Flathub Flatpak remote and remove the Fedora Flatpak remote
+          flatpak remote-add --system --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak install --system -y flathub ${flatpak_refs[@]}
+          ostree refs --repo=\${FLATPAK_SYSTEM_DIR}/repo | grep '^deploy/' | grep -v 'org\.freedesktop\.Platform\.openh264' | sed 's/^deploy\///g' > /output/flatpaks-with-deps
+          EOF
+
+          # Create Flatpak List with dependencies
+          flatpak_list_args=()
+          flatpak_list_args+=("--rm" "--privileged")
+          flatpak_list_args+=("--entrypoint" "/usr/bin/bash")
+          flatpak_list_args+=("--env" "FLATPAK_SYSTEM_DIR=/flatpak/flatpak")
+          flatpak_list_args+=("--env" "FLATPAK_TRIGGERSDIR=/flatpak/triggers")
+          flatpak_list_args+=("--volume" "$(realpath ./${build_dir}):/output")
+          flatpak_list_args+=("--volume" "${TEMP_FLATPAK_INSTALL_DIR}:/temp_flatpak_install_dir")
+          flatpak_list_args+=("${IMAGE_FULL}" /temp_flatpak_install_dir/install-flatpaks.sh)
+
+          if [[ ! -f "${build_dir}/flatpaks-with-deps" ]]; then
+              podman run "${flatpak_list_args[@]}"
+          else
+              echo "WARNING - Reusing previous determined flatpaks-with-deps"
+          fi
+
+          podman rmi ${IMAGE_FULL}
+
+          # List Flatpaks with Dependencies
+          cat "${build_dir}/flatpaks-with-deps"
+
+          # Build ISO
+          iso_build_args=()
+          iso_build_args+=("--rm" "--privileged" "--pull=newer")
+          iso_build_args+=("--volume=${PWD}:/github/workspace/")
+          iso_build_args+=("ghcr.io/jasonn3/build-container-installer:v1.2.3")
+          iso_build_args+=(ARCH="x86_64")
+          iso_build_args+=(ENROLLMENT_PASSWORD="silverblue")
+          iso_build_args+=(FLATPAK_REMOTE_REFS_DIR="/github/workspace/${build_dir}")
+          iso_build_args+=(IMAGE_NAME="${{ env.IMAGE_NAME }}")
+          iso_build_args+=(IMAGE_REPO="${IMAGE_REPO}")
+          iso_build_args+=(IMAGE_SIGNED="true")
+          iso_build_args+=(IMAGE_TAG="${{ env.DEFAULT_TAG }}")
+          iso_build_args+=(ISO_NAME="/github/workspace/${build_dir}/${{ env.IMAGE_NAME }}-${{ env.DEFAULT_TAG }}.iso")
+          iso_build_args+=(SECURE_BOOT_KEY_URL="https://github.com/${{ github.repository }}/raw/${{ github.ref_name }}/certs/public_key.der")
+          iso_build_args+=(VARIANT="Silverblue")
+          iso_build_args+=(VERSION="${{ matrix.fedora_version}}")
+          iso_build_args+=(WEB_UI="false")
+
+          sudo podman run "${iso_build_args[@]}"
+
+          if [[ "${UID}" -gt "0" ]]; then
+              sudo chown "${UID}:${GROUPS}" -R "${PWD}"
+          elif [[ -n "${SUDO_UID:-}" ]]; then
+              chown "${SUDO_UID}":"${SUDO_GID}" -R "${PWD}"
+          fi
+
+      - name: Move ISOs to Upload Directory
+        id: upload-directory
+        shell: bash
+        run: |
+          ISO_UPLOAD_DIR=${{ github.workspace }}/upload
+          mkdir ${ISO_UPLOAD_DIR}
+          mv ${{ env.ISO_BUILD_DIR }}/${{ env.ISO_NAME }} ${ISO_UPLOAD_DIR}
+          mv ${{ env.ISO_BUILD_DIR }}/${{ env.ISO_NAME }}-CHECKSUM ${ISO_UPLOAD_DIR}
+          echo "iso-upload-dir=${ISO_UPLOAD_DIR}" >> $GITHUB_OUTPUT
+
+      - name: Upload ISOs and Checksum to Job Artifacts
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4
+        with:
+          name: ${{ env.ISO_NAME }}
+          path: ${{ steps.upload-directory.outputs.iso-upload-dir }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          overwrite: true
+
+      - name: Upload ISOs and Checksum to R2 to Bluefin Bucket
+        if: github.ref_name == 'testing' && contains(matrix.base_name,'cosmic')
+        shell: bash
+        env:
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_REGION: auto
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          SOURCE_DIR: ${{ steps.upload-directory.outputs.iso-upload-dir }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rclone
+          rclone copy $SOURCE_DIR R2:cosmic
