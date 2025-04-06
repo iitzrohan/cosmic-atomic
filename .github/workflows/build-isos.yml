@@ -1,0 +1,15 @@
+name: Build All ISOs
+on:
+  schedule:
+    - cron: "50 4 * * 0" # 4:50 UTC Sunday
+  workflow_dispatch:
+
+permissions:
+    contents: read
+    packages: write
+    id-token: write
+
+jobs:
+    build-iso-42:
+        uses: ./.github/workflows/build-iso-42.yml
+        secrets: inherit

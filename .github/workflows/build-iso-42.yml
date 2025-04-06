@@ -1,0 +1,16 @@
+name: Fedora 42 ISO
+on:
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  build-iso-42:
+    name: Build Fedora 42 ISOs
+    uses: ./.github/workflows/reusable-build-iso.yml
+    secrets: inherit
+    strategy:
+      fail-fast: false
+    with:
+      image_flavors: '["main", "nvidia-open"]'
+      brand_name: '["cosmic", "cosmic-dx"]'
+      fedora_version: 42
